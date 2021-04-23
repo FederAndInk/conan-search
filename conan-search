@@ -1,0 +1,318 @@
+#!/usr/bin/env zsh
+
+# variables:
+# CONAN_SEARCH_MAX_LEN: split lines after this number of characters, 0 do not split
+# CONAN_SEARCH_CACHE_TIME: time in second to consider a cached result valid
+
+cache_time=${CONAN_SEARCH_CACHE_TIME:-3600}
+tmpdir=/tmp/conan_search
+
+function from_cache() {
+  if [ -n "${opt_reload_cache}" ]; then
+    return 1
+  fi
+
+  local cache_file="$tmpdir/$1"
+
+  local cached_time_stamp=0
+  if [ -f "$cache_file" ]; then
+    cached_time_stamp=$(head -n1 "$cache_file")
+  fi
+
+  if (($cached_time_stamp + $cache_time < $(date "+%s"))); then
+    # reload cache
+    return 1
+  else
+    local elapsed=$(($(date "+%s") - $cached_time_stamp))
+    local elapsed_s=$(($elapsed % 60))
+    local elapsed_m=$(($elapsed / 60))
+    local elapsed_h=$(($elapsed / 3600))
+    local ttl=$(($cache_time - $elapsed))
+    local ttl_s=$(($ttl % 60))
+    local ttl_m=$((($ttl / 60) % 60))
+    local ttl_h=$(($ttl / 3600))
+    if [ -z "${opt_raw}" ]; then
+      print >&2 "taking results from cache (${elapsed_h:+${elapsed_h}h }${elapsed_m:+${elapsed_m}m }${elapsed_s}s ago, still valid for ${ttl_h:+${ttl_h}h }${ttl_m:+${ttl_m}m }${ttl_s}s) configure with CONAN_SEARCH_CACHE_TIME"
+    fi
+    tail -n+2 "$cache_file"
+  fi
+}
+
+# use stdin
+# cache $to_cache_value variable
+function to_cache() {
+  local cache_file="$tmpdir/$1"
+
+  local ttl_s=$(($cache_time % 60))
+  local ttl_m=$((($cache_time / 60) % 60))
+  local ttl_h=$(($cache_time / 3600))
+  if [ -z "${opt_raw}" ]; then
+    print >&2 "caching results for ${ttl_h:+${ttl_h}h }${ttl_m:+${ttl_m}m }${ttl_s}s configure with CONAN_SEARCH_CACHE_TIME"
+  fi
+
+  mkdir -p "$tmpdir"
+  date "+%s" >"$cache_file"
+  print -R - "$to_cache_value" >>"$cache_file"
+}
+
+tcol=$(tput cols)
+# 0: don't split lines
+max_len=${CONAN_SEARCH_MAX_LEN:-$((120 < $tcol ? 140 : $tcol))}
+
+function extract_json() {
+  local html_page=$(curl "$1" 2>/dev/null)
+
+  if ((${#html_page} == 0)); then
+    return 1
+  else
+    # locate js part
+    local res=$(print -R - "$html_page" | cat - | grep 'window.__NUXT__' | grep -Po 'function\(.*\).*\(.*\)\)' | rev | cut -b2- | rev | perl -pe 's|^function|function fct|' | rev | perl -pe 's|(^.*?\()\}\}\}|;\1tcf=ser tsnoc;\}\}\}|' | rev | perl -pe 's|\\n| |g')
+    set -e
+    local json=$(
+      js78 <<EOF
+$res
+if (typeof (res) !== 'undefined' && !("error" in res && res.error != null)) {
+  console.log("const res=" + JSON.stringify(res) + ";");
+  if (res?.state?.packagedetails?.name != undefined) {
+    console.log(res.state.packagedetails.name)
+  } else {
+    console.log("!")
+  }
+  
+}
+EOF
+    )
+    set +e
+    print -n -R - "$json"
+
+    return $((${#json} == 0))
+  fi
+}
+
+# (url, name[, prefix])
+function load_to_res() {
+  local cache_file="$3$2"
+  res=$(from_cache "$cache_file")
+  if (($? != 0)); then
+    res=$(extract_json "$1")
+    if (($? != 0)); then
+      print "no result for '$2'"
+      exit 2
+    fi
+    local name=$(print -n -R - "$res" | tail -n1)
+    res=$(print -n -R - "$res" | head -n-1)
+    if [ "${name}" != "!" ]; then
+      pushd "$tmpdir"
+      ln -s "$3$name" "$cache_file"
+      popd
+      cache_file="$3$name"
+    fi
+
+    local to_cache_value="$res"
+    to_cache "$cache_file"
+  fi
+}
+
+js_fcts=$(
+  cat <<'EOF'
+function postalign(str, max) {
+  str = "" + str;
+  return str + " ".repeat(Math.abs(max - str.length));
+}
+
+/**
+ * 
+ * @param {number} indent 
+ * @param {string} str 
+ * @param {number} max 
+ */
+function split_line(indent, str, max) {
+  const maxlen = max - indent;
+  if (str.length <= maxlen || max <= 0) {
+    return str;
+  }
+  const words = str.split(" ");
+  let block = words.shift();
+  let line_len = block.length;
+  for (const w of words) {
+    if (line_len + w.length > maxlen) {
+      block += "\n" + " ".repeat(indent + 1);
+      line_len = 0;
+    }
+    line_len += w.length + 1;
+    block += " " + w;
+  }
+  return block;
+}
+EOF
+)
+
+function package_search() {
+  local res
+  load_to_res "https://conan.io/center/search/$1" "$1" 'c'
+
+  set -e
+  js78 <<EOF
+$res
+$js_fcts
+
+const pkgs = [];
+let max_pkg_ref_len = 0;
+for (const pkg of res.state.smartsearch.results) {
+  let pkg_str = pkg.name + "/" + pkg.latest_version + "@";
+  if (pkg.user !== "_") {
+    pkg_str += pkg.user + "/" + pkg.channel;
+  }
+  pkgs.push({ ...pkg, ref: pkg_str });
+  max_pkg_ref_len = Math.max(max_pkg_ref_len, pkg_str.length);
+}
+
+for (const pkg of pkgs) {
+  console.log(postalign(pkg.ref, max_pkg_ref_len) + " -- " +
+    split_line(max_pkg_ref_len + 4, pkg.description.replace(/\s\s+/g, " ").trim(), $max_len));
+}
+EOF
+  set +e
+}
+
+function all_packages() {
+  local res
+  load_to_res "https://conan.io/center/allpackages" "allpackages"
+
+  set -e
+  js78 <<EOF
+$res
+$js_fcts
+
+const pkgs = [];
+let max_pkg_ref_len = 0;
+for (const pkg of res.state.allpackages) {
+  let pkg_str = pkg.name + "/" + pkg.latest_version + "@";
+  if (pkg.user !== "_") {
+    pkg_str += pkg.user + "/" + pkg.channel;
+  }
+  pkgs.push({ ...pkg, ref: pkg_str });
+  max_pkg_ref_len = Math.max(max_pkg_ref_len, pkg_str.length);
+}
+
+for (const pkg of pkgs) {
+  console.log(postalign(pkg.ref, max_pkg_ref_len) + " -- " +
+    split_line(max_pkg_ref_len + 4, pkg.description.replace(/\s\s+/g, " ").trim(), $max_len));
+}
+EOF
+  set +e
+}
+
+function package_versions() {
+  load_to_res "https://conan.io/center/$1" "$1" 'd'
+
+  set -e
+  js78 <<EOF
+$res
+$js_fcts
+
+const pkg = res.state.packagedetails;
+let user_channel = "";
+if (pkg.user !== "_") {
+  user_channel = pkg.user + "/" + pkg.channel;
+}
+const partial_len = (pkg.name + "/" + "@" + user_channel).length;
+const max_len = res.state.versions.reduce(function (prev, current) {
+  return Math.max(prev, current.version.length + partial_len);
+}, 0);
+for (const version of res.state.versions) {
+  let details = "";
+  if ("$opt_details" !== "") {
+    details = " -- " + version.license;
+  }
+  console.log(postalign(pkg.name + "/" + version.version + "@" + user_channel, max_len) + details);
+}
+EOF
+  set +e
+}
+
+function package_details() {
+  load_to_res "https://conan.io/center/$1" "$1" 'd'
+
+  set -e
+  js78 <<EOF
+$res
+$js_fcts
+const pkg = res.state.packagedetails;
+console.log(pkg.name + ": " + split_line(pkg.name.length + 2, pkg.description.replace(/\s\s+/g, " ").trim(), $max_len));
+console.log("url: " + res.state.url);
+console.log("license: " + pkg.license);
+console.log("topics: " + pkg.topics);
+console.log(pkg.downloads + " downloads");
+console.log(pkg.num_versions + " versions");
+EOF
+  set +e
+}
+
+function usage() {
+  print "usage: conan-search <string> [-v|--versions|-d|--details]"
+  print "usage: conan-search -a|--all"
+  print "options:"
+  print -- "--remove   -r   -- remove cache"
+  print -- "--all      -a   -- list all packages"
+  print -- "--details  -d   -- details of a package"
+  print -- "--versions -v   -- list versions of a package"
+  print -- "--raw           -- do not output cache logs"
+  print -- "--reload-cache  -- reload cache"
+  print -- "--help          -- show this message"
+}
+
+if (($# < 1)); then
+  usage
+  return 1
+fi
+
+opt_all=""
+opt_remove=""
+opt_versions=""
+opt_details=""
+opt_reload_cache=""
+opt_raw=""
+opt_help=""
+zparseopts -F -D -E -- a=opt_all -all=opt_all v=opt_versions -versions=opt_versions d=opt_details -details=opt_details -raw=opt_raw -reload-cache=opt_reload_cache -help=opt_help -remove=opt_remove r=opt_remove ||
+  (usage && exit 1) || exit 1
+
+if [ -n "$opt_help" ]; then
+  usage
+  exit 0
+elif [ -n "$opt_all" ] && ([ -n "$opt_versions" ] || [ -n "$opt_details" ]); then
+  print -- "--all can't be used with --versions nor --details"
+  exit 1
+elif [ -n "$opt_all" ]; then
+  # --all
+  all_packages
+elif [ -n "$opt_remove" ]; then
+  # --remove
+  print "remove '$tmpdir'?"
+  rm -rI "$tmpdir"
+elif [ -n "$opt_details" ] || [ -n "$opt_versions" ]; then
+  if [ -n "$opt_details" ]; then
+    # --details
+    if (($# < 1)); then
+      usage
+      print "\n<string> missing"
+      exit 1
+    fi
+    package_details "$1"
+    opt_raw="--raw"
+  fi
+  if [ -n "$opt_versions" ]; then
+    # --versions
+    if (($# < 1)); then
+      usage
+      print "\n<string> missing"
+      exit 1
+    fi
+    package_versions "$1"
+  fi
+else
+  # <string>
+  package_search "$1"
+fi
+
+# TODO: clean cache
