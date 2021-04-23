@@ -4,7 +4,7 @@
 # CONAN_SEARCH_MAX_LEN: split lines after this number of characters, 0 do not split
 # CONAN_SEARCH_CACHE_TIME: time in second to consider a cached result valid
 
-cache_time=${CONAN_SEARCH_CACHE_TIME:-3600}
+cache_time=${CONAN_SEARCH_CACHE_TIME:-86400}
 tmpdir=/tmp/conan_search
 
 function from_cache() {
