@@ -101,7 +101,7 @@ function load_to_res() {
     fi
     local name=$(print -n -R - "$res" | tail -n1)
     res=$(print -n -R - "$res" | head -n-1)
-    if [ "${name}" != "!" ]; then
+    if [ "${name}" != "!" ] && [ "$3$name" != "$cache_file" ]; then
       pushd "$tmpdir"
       ln -s "$3$name" "$cache_file"
       popd
