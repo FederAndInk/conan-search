@@ -25,7 +25,7 @@ function from_cache() {
   else
     local elapsed=$(($(date "+%s") - $cached_time_stamp))
     local elapsed_s=$(($elapsed % 60))
-    local elapsed_m=$(($elapsed / 60))
+    local elapsed_m=$((($elapsed / 60) % 60))
     local elapsed_h=$(($elapsed / 3600))
     local ttl=$(($cache_time - $elapsed))
     local ttl_s=$(($ttl % 60))
